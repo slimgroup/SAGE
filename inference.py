@@ -11,6 +11,7 @@ from torch_utils import distributed as dist
 import dnnlib
 from training import dataset
 from torch_utils.misc import StackedRandomGenerator
+from torch_utils.ambient_diffusion import get_well_mask
 import json
 from collections import OrderedDict
 import warnings
@@ -22,44 +23,207 @@ import pdb
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import mean_squared_error
 
+def cdist_masked(x1, x2, mask1=None, mask2=None):
+    if mask1 is None or mask2 is None:
+        mask1 = torch.ones_like(x1)
+        mask2 = torch.ones_like(x2)
+    x1 = x1[0].unsqueeze(0)
+    diffs = x1.unsqueeze(1) - x2.unsqueeze(0)
+    combined_mask = mask1.unsqueeze(1) * mask2.unsqueeze(0)
+    error = 0.5 * torch.linalg.norm(combined_mask * diffs)**2
+    return error
+
 def ambient_sampler(
     net, latents, randn_like=torch.randn_like,
-    num_steps=10, sigma_min=0.1, sigma_max=80, rho=7,
-    S_churn=0.0, S_min=0.0, S_max=float('inf'), S_noise=10,
-    cond_loc = "",
-    image_dir = "",
-    cond=None
-    ):
-   
+    num_steps=30, sigma_min=0.05, sigma_max=80, rho=7,
+    S_churn=0.0, S_min=0.0, S_max=float('inf'), S_noise=1,
+    sampler_seed=42, 
+    same_for_all_batch=False,
+    num_masks=1,
+    guidance_scale=0.0,
+    clipping=True,
+    static=True,  # whether to use soft clipping or static clipping
+    resample_guidance_masks=False,
+    rtm_loc = "", guidance_weight = 0.0
+):
+    class_labels = None
+    # sigma_min = max(sigma_min, net.sigma_min)
+    # sigma_max = min(sigma_max, net.sigma_max)
+    print("net.sigma_min")
+    print(sigma_min)
+    print("net.sigma_max")
+    print(sigma_max)
+
+    clean_image = None
+
+    def sample_masks():
+        masks = []
+        for i in range(num_masks):
+            #corruption_mask = get_well_mask(latents.shape, 256, same_for_all_batch=False, device=latents.device, seed=sampler_seed)
+            corruption_mask = get_well_mask(latents.shape, 4, same_for_all_batch=False, device=latents.device, seed=None)
+            masks.append(corruption_mask)
+
+            # corruption_mask = torch.from_numpy(torch.load("corruption_masks/hat_corruption_mask_0.pt")).unsqueeze(0).unsqueeze(0).to(('cuda'))
+            # masks.append(corruption_mask)
+
+            # plt.figure()
+            # plt.imshow(corruption_mask.detach().cpu().numpy()[0,0,:,:])
+            # plt.colorbar()
+            # plt.savefig("corruption_mask_{}".format(i))
+            # plt.close()
+        masks = torch.stack(masks)
+        return masks
+
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    print("step_indices")
+    print(step_indices)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
-    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0    
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+    print("t_steps")
+    print(t_steps)
 
     # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
-    with torch.no_grad():
-        for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
-            x_cur = x_next
+    print("x_next")
+    print(x_next)
 
-            # Increase noise temporarily.
-            gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-            t_hat = net.round_sigma(t_cur + gamma * t_cur)
-            x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+
+    uncond = torch.zeros((1, 256, 256)) 
+    uncond = uncond.repeat(1,1,1,1).to(('cuda'))
+    #Deliberately throw an error
+    # raise Exception("An error occurred after the first line.")
+
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
+        # masks = sample_masks()
+        # print("t_next")
+        # print(t_next)
+        x_cur = x_next
+
+        # Increase noise temporarily.
+        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+        t_hat = net.round_sigma(t_cur + gamma * t_cur)
+        # print("t_hat")
+        # print(t_hat)
+        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+        
+        # x_hat = x_cur
+        x_hat = x_hat.detach()
+        x_hat.requires_grad = True
+
+        denoised = []
+        for mask_index in range(num_masks):
+            print(mask_index)
+            masks = sample_masks()
+            print(masks.shape)
+            corruption_mask = masks[mask_index]
+
+            masked_image = corruption_mask * x_hat
+            # masked_image = masked_image/torch.max(torch.abs(masked_image))
+
+            # d_tensor = torch.from_numpy(torch.load(rtm_loc))
+            # d_tensor = d_tensor.unsqueeze(0)
+            d_tensor = np.load(rtm_loc) 
+            d_tensor = torch.from_numpy(d_tensor[np.newaxis,...]) 
+            #d_tensor_repeated = d_tensor.repeat(1,1,1,1).to(('cuda'))
+            d_tensor_repeated = d_tensor.repeat(1,1,1,1).to(('cuda'))
+            # d_tensor_repeated = d_tensor_repeated + 0.01 * randn_like(d_tensor_repeated)
+            # print(d_tensor_repeated.shape)
+            # print(masked_image.shape)
+            # print(corruption_mask.shape)
+
+            net_input_cond = torch.cat([masked_image, corruption_mask, d_tensor_repeated], dim=1)
+            net_input_uncond = torch.cat([masked_image, corruption_mask, uncond], dim=1)
+
+            net_output_cond = net(net_input_cond, t_hat, class_labels).to(torch.float64)[:, :1]
+            net_output_uncond= net(net_input_uncond, t_hat, class_labels).to(torch.float64)[:, :1]
+
+            net_output = (1 + guidance_weight) * net_output_cond - guidance_weight * net_output_uncond
+
+            # print(net_output.shape)
+
+            #if clipping:
+            #    net_output = tensor_clipping(net_output, static=static)
+
+            if clean_image is not None:
+                net_output = corruption_mask * net_output + (1 - corruption_mask) * clean_image
 
             # Euler step.
-            net_input = torch.cat([x_hat, cond], dim=1)
-            denoised = net(net_input, t_hat).to(torch.float64)[:, :1]
-            d_cur = (x_hat - denoised) / t_hat
-            x_next = x_hat + (t_next - t_hat) * d_cur
+            denoised.append(net_output)
 
-            # Apply 2nd order correction.
-            if i < num_steps - 1:
-                net_input = torch.cat([x_next, cond], dim=1)
-                denoised = net(net_input, t_next).to(torch.float64)[:, :1]
-                d_prime = (x_next - denoised) / t_next
-                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
+        stack_denoised = torch.stack(denoised)
+        flattened = stack_denoised.view(stack_denoised.shape[0], -1)
+        l2_norm = cdist_masked(flattened, flattened, None, None)
+        l2_norm = l2_norm.mean()
+        rec_grad = torch.autograd.grad(l2_norm, inputs=x_hat)[0]
+
+        # print("Stack Denoised Shape")
+        # print(stack_denoised.shape)
+        # clean_pred = stack_denoised[0]
+        clean_pred = torch.mean(stack_denoised, dim=0, keepdim=True).squeeze(0)
+        single_mask_grad = (t_next - t_hat) * (x_hat - clean_pred) / t_hat
+        grad_1 = single_mask_grad - guidance_scale * rec_grad
+        x_next += grad_1
+
+        if i < num_steps - 1:
+            masks = sample_masks()
+            x_next = x_next.detach()
+            x_next.requires_grad = True
+
+            denoised = []
+            for mask_index in range(num_masks):
+                corruption_mask = masks[mask_index]
+                masked_image = corruption_mask * x_next
+                # masked_image = masked_image/torch.max(torch.abs(masked_image))
+
+                # plt.figure()
+                # plt.imshow(masked_image.detach().cpu().numpy()[0,0,:,:])
+                # plt.savefig("masked_images_iterated_32_network/masked_image{}".format(i))
+                # plt.close()
+
+
+                net_input_cond = torch.cat([masked_image, corruption_mask, d_tensor_repeated], dim=1)
+                net_input_uncond = torch.cat([masked_image, corruption_mask, uncond], dim=1)
+
+                net_output_cond = net(net_input_cond, t_hat, class_labels).to(torch.float64)[:, :1]
+                net_output_uncond= net(net_input_uncond, t_hat, class_labels).to(torch.float64)[:, :1]
+
+                net_output = (1 + guidance_weight) * net_output_cond - guidance_weight * net_output_uncond
+
+                #if clipping:
+                #    net_output = tensor_clipping(net_output, static=static)
+                
+                if clean_image is not None:
+                    net_output = corruption_mask * net_output + (1 - corruption_mask) * clean_image
+                denoised.append(net_output)
+            
+            stack_denoised = torch.stack(denoised)
+            flattened = stack_denoised.view(stack_denoised.shape[0], -1)
+            l2_norm = cdist_masked(flattened, flattened, None, None)
+            rec_grad = torch.autograd.grad(l2_norm, inputs=x_next)[0]
+
+            clean_pred = torch.mean(stack_denoised, dim=0, keepdim=True).squeeze(0)
+            single_mask_grad = (t_next - t_hat) * (x_next - clean_pred) / t_next
+            grad_2 = single_mask_grad - guidance_scale * rec_grad
+            x_next = x_hat + 0.5 * (grad_1 + grad_2)
+
+            # plt.figure()
+            # plt.imshow(x_next.detach().cpu().numpy()[0,0,:,:])
+            # #plt.savefig("x_next_iterated_32_network/x_next_{}".format(i))
+            # plt.savefig("5_well_good_rtm_1040_dataset_sample/5well_good_rtm_test_8242_2/8242_test_rtm2/x_next/x_next_{}".format(i))
+            # plt.close()
+        else:
+            if clean_image is not None:
+                x_next = masks[0] * x_next + (1 - masks[0]) * clean_image
+            else:
+                clean_image = x_next
+                x_next = x_hat + grad_1
+            # plt.figure()
+            # plt.imshow(x_next.detach().cpu().numpy()[0,0,:,:])
+            # #plt.savefig("x_next_iterated_32_network/x_next_{}".format(i))
+            # plt.savefig("5_well_good_rtm_1040_dataset_sample/5well_good_rtm_test_8242_2/8242_test_rtm2/x_next/x_next_{}".format(i))
+            # plt.close()
     return x_next
 
 def main(network_loc, training_options_loc, outdir, seeds, num_steps, max_batch_size, 
@@ -90,7 +254,7 @@ def main(network_loc, training_options_loc, outdir, seeds, num_steps, max_batch_
     else:
         label_dim = 0
 
-    interface_kwargs = dict(img_resolution=training_options['dataset_kwargs']['resolution'], label_dim=label_dim, img_channels=2)
+    interface_kwargs = dict(img_resolution=training_options['dataset_kwargs']['resolution'], label_dim=label_dim, img_channels=3)
     network_kwargs = training_options['network_kwargs']
     model_to_be_initialized = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
 
@@ -153,8 +317,8 @@ def main(network_loc, training_options_loc, outdir, seeds, num_steps, max_batch_
         plt.savefig(os.path.join(image_dir, "actual_condition.png"),bbox_inches = "tight",dpi=300)
 
         gt = np.load(gt_loc) 
-        vmin_gt = 1.5
-        vmax_gt = 3.7#4.5
+        vmin_gt = None#1.5
+        vmax_gt = None#3.7#4.5
         cmap_gt = cc.cm['rainbow4']
 
         plt.figure();  plt.title("Ground truth")
@@ -186,8 +350,11 @@ def main(network_loc, training_options_loc, outdir, seeds, num_steps, max_batch_
            
             # Generate images.
             sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
-            images = ambient_sampler(net, latents,num_steps=num_steps, randn_like=rnd.randn_like,
-                cond=cond, image_dir=image_dir, **sampler_kwargs)
+            # images = ambient_sampler(net, latents,num_steps=num_steps, randn_like=rnd.randn_like,
+            #     cond=cond, image_dir=image_dir, **sampler_kwargs)
+            images = ambient_sampler(net, latents, randn_like=rnd.randn_like, sampler_seed=batch_seeds, 
+                guidance_scale=0.0, 
+                rtm_loc = cond_loc, guidance_weight = 0.0, **sampler_kwargs,)
             
             # Save Images
             images_np = images.cpu().detach().numpy()
@@ -202,6 +369,7 @@ def main(network_loc, training_options_loc, outdir, seeds, num_steps, max_batch_
                 cb = plt.colorbar(fraction=0.0235, pad=0.04); cb.set_label('[Km/s]')
                 plt.savefig(image_path, bbox_inches = "tight",dpi=300)
                 plt.close()
+                
                 os.makedirs(os.path.join(image_dir, f'saved/'), exist_ok=True)
                 np.save(os.path.join(image_dir, f'saved/{seed:06d}')+ ".npy", one_image[0, :, :])
             images_np_stack[batch_count-1,0,:,:] = one_image
