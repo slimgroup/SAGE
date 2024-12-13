@@ -39,7 +39,7 @@ def training_loop(
     total_kimg          = 200000,   # Training duration, measured in thousands of training images.
     ema_halflife_kimg   = 500,      # Half-life of the exponential moving average (EMA) of model weights.
     ema_rampup_ratio    = 0.05,     # EMA ramp-up coefficient, None = no rampup.
-    lr_rampup_kimg      = 10,    # Learning rate ramp-up duration.
+    lr_rampup_kimg      = 100,    # Learning rate ramp-up duration.
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     kimg_per_tick       = 50,       # Interval of progress prints.
     snapshot_ticks      = 50,       # How often to save network snapshots, None = disable.
@@ -50,6 +50,7 @@ def training_loop(
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
     max_grad_norm       = None,     # gradient clipping.
+    val_interval        = 5,        # Validation interval in ticks
 ):
     # Initialize.
     start_time = time.time()
@@ -75,10 +76,16 @@ def training_loop(
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
 
+    #get condition to get number of channels 
+    dataset_iter = next(dataset_iterator)
+    images, cond = dataset_iter
+    print("Condition has this number of channels:")
+    print(cond.shape[1])
+    num_chan_total = images.shape[1] + cond.shape[1]
+
     # Construct network.
     dist.print0('Constructing network...')
-    interface_kwargs = dict(img_resolution=dataset_obj.resolution, label_dim=dataset_obj.label_dim, img_channels=3 * dataset_obj.num_channels)
-
+    interface_kwargs = dict(img_resolution=dataset_obj.resolution, label_dim=dataset_obj.label_dim, img_channels=num_chan_total)
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
 
     net.train().requires_grad_(True).to(device)
@@ -134,19 +141,13 @@ def training_loop(
 
                 dataset_iter = next(dataset_iterator)
                 
-                images, corruption_matrix, hat_corruption_matrix, d = dataset_iter
-                corruption_matrix = corruption_matrix.to(device)
-                hat_corruption_matrix = hat_corruption_matrix.to(device)
-                d = d.to(device)
-              
-                images = images.to(device).to(torch.float32)
-    
+                images, cond = dataset_iter
 
-                train_loss, val_loss, test_loss = loss_fn(net=ddp, images=images, augment_pipe=augment_pipe, 
-                    corruption_matrix=corruption_matrix, hat_corruption_matrix=hat_corruption_matrix, d=d)
-                
-                training_stats.report('Loss/loss_val', val_loss)
-                training_stats.report('Loss/loss_test', test_loss)
+                cond = cond.to(device).to(torch.float32)
+                images = images.to(device).to(torch.float32)
+             
+                train_loss = loss_fn(net=ddp, images=images, cond=cond, augment_pipe=augment_pipe)
+
                 training_stats.report('Loss/loss_train', train_loss)
 
                 scalar_loss = train_loss.sum().mul(loss_scaling / batch_gpu_total)

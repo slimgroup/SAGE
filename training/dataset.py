@@ -15,6 +15,7 @@ import torch
 import dnnlib
 import matplotlib.pyplot as plt
 import random
+import pdb
 
 #----------------------------------------------------------------------------
 # Abstract base class for datasets.
@@ -23,16 +24,28 @@ class Dataset(torch.utils.data.Dataset):
     def __init__(self,
         name,                   # Name of the dataset.
         dataset_main_name,
+        dataset_main_name_cond,
         raw_shape,              # Shape of the raw image data (NCHW).
+        dataset_main_name_back=None,
+        cond_norm=1,
+        gt_norm=1,
+        use_offsets=False,
         max_size    = None,     # Artificially limit the size of the dataset. None = no limit. Applied before xflip.
         use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
         xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed = 0,        # Random seed to use when applying max_size.
         cache       = False,    # Cache images in CPU memory?
+
     ):
 
         self._name = name
         self.dataset_main_name = dataset_main_name
+        self.dataset_main_name_cond = dataset_main_name_cond
+        self.dataset_main_name_back = dataset_main_name_back
+        self.cond_norm = cond_norm
+        self.gt_norm = gt_norm
+        #self.num_offsets = num_offsets
+        self.use_offsets = use_offsets
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
         self._cache = cache
@@ -42,15 +55,12 @@ class Dataset(torch.utils.data.Dataset):
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
-        if (max_size is not None) and (self._raw_idx.size > max_size):
+        #if (max_size is not None) and (self._raw_idx.size > max_size):
             # np.random.RandomState(random_seed % (1 << 31)).shuffle(self._raw_idx)
-            self._raw_idx = np.sort(self._raw_idx[:max_size])
+        #    self._raw_idx = np.sort(self._raw_idx[:max_size])
 
         # Apply xflip.
-        self._xflip = np.zeros(self._raw_idx.size, dtype=np.uint8)
-        if xflip:
-            self._raw_idx = np.tile(self._raw_idx, 2)
-            self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
+        self.xflip = xflip
 
     def _get_raw_labels(self):
         if self._raw_labels is None:
@@ -90,36 +100,46 @@ class Dataset(torch.utils.data.Dataset):
 
         idx_str = str(idx).zfill(4)  # This will ensure the index is always 4 digits long
 
-      
-        
-        # For conditional
-        cond = np.load(f'{self.dataset_main_name}/train/256x256_rtms/rtm_{idx_str}.npy')
-        cond = torch.from_numpy(cond[np.newaxis,...])
+        cond = np.load(f'{self.dataset_main_name_cond}_{idx_str}.npy') / self.cond_norm
+        #print(cond.shape)
+        if not self.use_offsets:
+            print("use only zero offset:")
+            if len(cond.shape) > 2:
+                rtm_chan = int(round(cond.shape[0]/2))
+                print(rtm_chan)
+                cond = cond[rtm_chan,:,:]
+            cond = cond[np.newaxis,...]
 
-        # cond[0,0:20,:] = 0
+        #load in background model 
+        if not (self.dataset_main_name_back == None):
+            print("using background ")
+            background = np.load(f'{self.dataset_main_name_back}_{idx_str}.npy')  / self.gt_norm
+            if len(background.shape) < 3:
+                background = background[np.newaxis,...] 
+            cond = np.concatenate([cond, background], axis=0)
 
-        image_corrupted = np.load(f'{self.dataset_main_name}/train/256x256_corrupted_velocity/corrupted_velocity_{idx_str}.npy')
-        image_corrupted = torch.from_numpy(image_corrupted[np.newaxis,...])
-        # print(image_corrupted.shape)
+        #insert mask
+        if not (self.dataset_main_name_back == None):
+            print("using mask ")
+            mask = np.ones((1, 256, 512))
+            # if len(background.shape) < 3:
+            #     background = background[np.newaxis,...] 
+            cond = np.concatenate([cond, mask], axis=0)
 
-        corruption_mask = np.load(f'{self.dataset_main_name}/train/256x256_corruption_mask/corruption_mask_{idx_str}.npy')
-        corruption_mask = torch.from_numpy(corruption_mask[np.newaxis,...])
-        # print(corruption_mask.shape)
+        target_image = np.load(f'{self.dataset_main_name}_{idx_str}.npy')
+        target_image = target_image[np.newaxis,...]  / self.gt_norm
 
-        hat_corruption_mask = np.load(f'{self.dataset_main_name}/train/256x256_hat_corruption_mask/hat_corruption_mask_{idx_str}.npy')
-        hat_corruption_mask =  torch.from_numpy(hat_corruption_mask[np.newaxis,...])
-        # print(hat_corruption_mask.shape)
+        if self.xflip:
+            rand_num = np.random.uniform()
+            if rand_num > 0.5:
+                if target_image.shape[-1] > 0:
+                    target_image = np.flip(target_image, 2)
+                if cond.shape[-1] > 0:
+                    cond = np.flip(cond, 2)
 
-        # Save the corruption and hat corruption matrix using idx
-        # torch.save(image[0,:,:], f'BG_test_good_rtm_256x256_multi_corrupt_2diff/image_{idx}.pt')
-        # torch.save(image_corrupted[0,:,:], f'saved_inputs/BG_test_good_rtm_256x256_multi_corrupt_2diff/image_corrupted_{idx}.pt')
-        # torch.save(corruption_mask[0,:,:], f'saved_inputs/BG_test_good_rtm_256x256_multi_corrupt_2diff/corruption_mask_{idx}.pt')
-        # torch.save(hat_corruption_mask[0,:,:], f'saved_inputs/BG_test_good_rtm_256x256_multi_corrupt_2diff/hat_corruption_mask_{idx}.pt')
-        # torch.save(cond[0,:,:], f'saved_inputs/BG_test_good_rtm_256x256_multi_corrupt_2diff/rtm_{idx}.pt') 
+        #need the copy if you have the flip
+        return torch.from_numpy(target_image.copy()), torch.from_numpy(cond.copy())
 
-        return image_corrupted, corruption_mask, hat_corruption_mask, cond
-
-        #return target_image, cond
 
     @property
     def name(self):
@@ -197,7 +217,7 @@ class ImageFolderDataset(Dataset):
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
         if resolution is not None and (raw_shape[2] != resolution):
             raise IOError('Image files do not match the specified resolution')
-        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
+        super().__init__(name=name, raw_shape=raw_shape,**super_kwargs)
 
     @staticmethod
     def _file_ext(fname):
